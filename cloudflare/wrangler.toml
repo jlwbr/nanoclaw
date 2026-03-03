@@ -1,0 +1,29 @@
+name = "nanoclaw-event-driven"
+main = "src/index.ts"
+compatibility_date = "2026-03-03"
+compatibility_flags = ["nodejs_compat"]
+
+# Configure per environment in your Cloudflare account.
+# This repository intentionally does not commit real IDs.
+
+[vars]
+APP_ENV = "dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nanoclaw"
+database_id = "REPLACE_WITH_D1_DATABASE_ID"
+
+[[durable_objects.bindings]]
+name = "TENANT_ORCHESTRATOR"
+class_name = "TenantOrchestrator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TenantOrchestrator"]
+
+# Future phases:
+# - Add queue producer/consumer bindings for agent run jobs
+# - Add R2 buckets for tenant file/session artifacts
+# - Add Containers binding for agent runtime execution
+

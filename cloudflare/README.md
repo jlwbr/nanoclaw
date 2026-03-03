@@ -1,0 +1,66 @@
+# Cloudflare Event-Driven Bootstrap
+
+This directory contains the first implementation slice for migrating NanoClaw to an event-driven Cloudflare architecture.
+
+## What is included
+
+- Worker entrypoint (`src/index.ts`) for:
+  - health endpoint
+  - webhook ingest endpoint (`POST /webhooks/:channel`)
+  - canonical event normalization and forwarding to per-tenant Durable Object
+- Durable Object skeleton (`src/durable-objects/tenant-orchestrator.ts`) for:
+  - idempotent event ingestion
+  - basic persistence into D1
+- Initial tenant-aware D1 schema migration (`d1/0001_tenant_core.sql`)
+- Wrangler configuration scaffold (`wrangler.toml`)
+
+## Why this is high-impact
+
+This is the foundation that unblocks:
+
+1. replacing polling with event ingress
+2. introducing tenant-aware persistence
+3. moving orchestrator logic into Durable Objects
+
+## Current scope
+
+This bootstrap is intentionally minimal and does **not** yet include:
+
+- queue-backed agent execution
+- Cloudflare Containers runtime invocation
+- channel-specific signature verification logic for each provider
+- outbound message delivery adapters
+
+Those are tracked in `docs/CLOUDFLARE_EVENT_DRIVEN_ROADMAP.md`.
+
+## Quick start (local)
+
+1. Install Wrangler (if not installed).
+2. Configure `wrangler.toml` bindings and IDs.
+3. Apply D1 schema:
+
+```bash
+wrangler d1 execute nanoclaw --file ./d1/0001_tenant_core.sql
+```
+
+4. Start local dev server:
+
+```bash
+wrangler dev
+```
+
+5. Test health endpoint:
+
+```bash
+curl "http://127.0.0.1:8787/health"
+```
+
+6. Test webhook endpoint:
+
+```bash
+curl -X POST "http://127.0.0.1:8787/webhooks/test-channel" \
+  -H "content-type: application/json" \
+  -H "x-tenant-id: tenant-dev" \
+  -d '{"chat_jid":"chat-1","sender":"user-1","content":"hello"}'
+```
+
