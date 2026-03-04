@@ -9,6 +9,8 @@ import {
   AgentRunJobMessage,
   CanonicalInboundEvent,
   Env,
+  TaskContextMode,
+  TaskScheduleType,
   TenantOrchestratorRequest,
 } from './types';
 
@@ -102,19 +104,36 @@ async function routeInboundEvent(
   env: Env,
   event: CanonicalInboundEvent,
 ): Promise<Response> {
-  const id = env.TENANT_ORCHESTRATOR.idFromName(event.tenantId);
-  const stub = env.TENANT_ORCHESTRATOR.get(id);
-
-  const requestBody: TenantOrchestratorRequest = {
+  return routeTenantRequest(env, event.tenantId, {
     type: 'inbound_event',
     event,
-  };
+  });
+}
+
+async function routeTenantRequest(
+  env: Env,
+  tenantId: string,
+  requestBody: TenantOrchestratorRequest,
+): Promise<Response> {
+  const id = env.TENANT_ORCHESTRATOR.idFromName(tenantId);
+  const stub = env.TENANT_ORCHESTRATOR.get(id);
 
   return stub.fetch('https://tenant-orchestrator/events', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(requestBody),
   });
+}
+
+function parseTaskScheduleType(raw: string): TaskScheduleType | null {
+  if (raw === 'cron' || raw === 'interval' || raw === 'once') return raw;
+  return null;
+}
+
+function parseTaskContextMode(raw: unknown): TaskContextMode | null {
+  if (raw === undefined || raw === null) return 'isolated';
+  if (raw === 'group' || raw === 'isolated') return raw;
+  return null;
 }
 
 function parseRunJob(
@@ -191,10 +210,6 @@ async function processRunJob(
 
   const result = await executeRunJob(env, job);
   if (!result.ok) {
-    await updateRunStatus(env, job, 'failed', {
-      detail: result.error,
-      runtimeMs: Date.now() - startedAt,
-    });
     return result;
   }
 
@@ -262,6 +277,95 @@ app.post('/webhooks/:channel', async (c) => {
   return response;
 });
 
+app.post('/tenants/:tenantId/tasks', async (c) => {
+  const tenantId = c.req.param('tenantId');
+  let payload: Record<string, unknown>;
+  try {
+    payload = (await c.req.json()) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const chatJid =
+    typeof payload.chatJid === 'string' ? payload.chatJid : undefined;
+  const groupFolder =
+    typeof payload.groupFolder === 'string' ? payload.groupFolder : undefined;
+  const prompt = typeof payload.prompt === 'string' ? payload.prompt : undefined;
+  const scheduleType = parseTaskScheduleType(
+    typeof payload.scheduleType === 'string' ? payload.scheduleType : '',
+  );
+  const scheduleValue =
+    typeof payload.scheduleValue === 'string' ? payload.scheduleValue : undefined;
+  const contextMode = parseTaskContextMode(payload.contextMode);
+
+  if (!chatJid || !groupFolder || !prompt || !scheduleType || !scheduleValue) {
+    return c.json({ error: 'Missing or invalid task fields' }, 400);
+  }
+  if (!contextMode) {
+    return c.json({ error: 'Invalid contextMode' }, 400);
+  }
+
+  return routeTenantRequest(c.env, tenantId, {
+    type: 'schedule_task',
+    tenantId,
+    chatJid,
+    groupFolder,
+    prompt,
+    scheduleType,
+    scheduleValue,
+    contextMode,
+  });
+});
+
+app.get('/tenants/:tenantId/tasks', async (c) => {
+  const tenantId = c.req.param('tenantId');
+  const statusRaw = c.req.query('status');
+  const status =
+    statusRaw === 'active' || statusRaw === 'paused' || statusRaw === 'completed'
+      ? statusRaw
+      : undefined;
+
+  if (statusRaw && !status) {
+    return c.json({ error: 'Invalid status filter' }, 400);
+  }
+
+  return routeTenantRequest(c.env, tenantId, {
+    type: 'list_tasks',
+    tenantId,
+    status,
+  });
+});
+
+app.post('/tenants/:tenantId/tasks/reconcile', async (c) => {
+  const tenantId = c.req.param('tenantId');
+  return routeTenantRequest(c.env, tenantId, {
+    type: 'reconcile_tasks',
+    tenantId,
+    reason: 'http_reconcile',
+  });
+});
+
+app.post('/tenants/:tenantId/tasks/:taskId/:action', async (c) => {
+  const tenantId = c.req.param('tenantId');
+  const taskId = c.req.param('taskId');
+  const actionRaw = c.req.param('action');
+  if (
+    actionRaw !== 'pause' &&
+    actionRaw !== 'resume' &&
+    actionRaw !== 'cancel' &&
+    actionRaw !== 'run_now'
+  ) {
+    return c.json({ error: 'Invalid task action' }, 400);
+  }
+
+  return routeTenantRequest(c.env, tenantId, {
+    type: 'task_action',
+    tenantId,
+    taskId,
+    action: actionRaw,
+  });
+});
+
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
 
 app.onError((err, c) => {
@@ -271,6 +375,37 @@ app.onError((err, c) => {
 
 export default {
   fetch: app.fetch,
+  async scheduled(controller: ScheduledController, env: Env): Promise<void> {
+    const now = new Date().toISOString();
+    const dueTenants = await env.DB.prepare(
+      `SELECT DISTINCT tenant_id
+       FROM scheduled_tasks
+       WHERE status = 'active'
+         AND next_run IS NOT NULL
+         AND next_run <= ?1
+       LIMIT 1000`,
+    )
+      .bind(now)
+      .all<{ tenant_id: string }>();
+
+    await Promise.allSettled(
+      dueTenants.results.map(async (row) => {
+        const response = await routeTenantRequest(env, row.tenant_id, {
+          type: 'reconcile_tasks',
+          tenantId: row.tenant_id,
+          reason: `cron:${controller.cron}`,
+        });
+        if (!response.ok) {
+          const text = await response.text();
+          console.error('tenant reconcile failed', {
+            tenantId: row.tenant_id,
+            status: response.status,
+            body: text,
+          });
+        }
+      }),
+    );
+  },
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
     const maxAttempts = parseMaxAttempts(env);
     for (const message of batch.messages) {
@@ -291,10 +426,16 @@ export default {
         const shouldRetry =
           result.retryable && message.attempts < maxAttempts;
         if (shouldRetry) {
+          await updateRunStatus(env, parsed, 'awaiting_runtime', {
+            detail: result.error,
+          });
           message.retry({
             delaySeconds: retryDelaySeconds(message.attempts),
           });
         } else {
+          await updateRunStatus(env, parsed, 'failed', {
+            detail: result.error,
+          });
           message.ack();
         }
       } catch (err) {
@@ -310,13 +451,13 @@ export default {
           err instanceof Error
             ? err.message
             : 'Unhandled queue processing error';
-        await updateRunStatus(env, parsed, 'failed', { detail });
-
         if (message.attempts < maxAttempts) {
+          await updateRunStatus(env, parsed, 'awaiting_runtime', { detail });
           message.retry({
             delaySeconds: retryDelaySeconds(message.attempts),
           });
         } else {
+          await updateRunStatus(env, parsed, 'failed', { detail });
           message.ack();
         }
       }

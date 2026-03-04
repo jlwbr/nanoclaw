@@ -20,6 +20,40 @@ export interface AgentRunJobMessage {
   enqueuedAt: string;
 }
 
+export type TaskScheduleType = 'cron' | 'interval' | 'once';
+export type TaskStatus = 'active' | 'paused' | 'completed';
+export type TaskContextMode = 'group' | 'isolated';
+
+export interface ScheduleTaskRequest {
+  type: 'schedule_task';
+  tenantId: string;
+  chatJid: string;
+  groupFolder: string;
+  prompt: string;
+  scheduleType: TaskScheduleType;
+  scheduleValue: string;
+  contextMode?: TaskContextMode;
+}
+
+export interface ListTasksRequest {
+  type: 'list_tasks';
+  tenantId: string;
+  status?: TaskStatus;
+}
+
+export interface TaskActionRequest {
+  type: 'task_action';
+  tenantId: string;
+  taskId: string;
+  action: 'pause' | 'resume' | 'cancel' | 'run_now';
+}
+
+export interface ReconcileTasksRequest {
+  type: 'reconcile_tasks';
+  tenantId: string;
+  reason?: string;
+}
+
 export interface InboundEventRequest {
   type: 'inbound_event';
   event: CanonicalInboundEvent;
@@ -41,7 +75,13 @@ export interface RunStatusUpdateRequest {
   runtimeMs?: number;
 }
 
-export type TenantOrchestratorRequest = InboundEventRequest | RunStatusUpdateRequest;
+export type TenantOrchestratorRequest =
+  | InboundEventRequest
+  | RunStatusUpdateRequest
+  | ScheduleTaskRequest
+  | ListTasksRequest
+  | TaskActionRequest
+  | ReconcileTasksRequest;
 
 export interface TenantOrchestratorResponse {
   ok: boolean;
@@ -50,6 +90,21 @@ export interface TenantOrchestratorResponse {
   tenantId: string;
   message: string;
   runId?: string;
+  taskId?: string;
+  tasks?: Array<{
+    id: string;
+    group_folder: string;
+    chat_jid: string;
+    prompt: string;
+    schedule_type: TaskScheduleType;
+    schedule_value: string;
+    context_mode: TaskContextMode;
+    next_run: string | null;
+    last_run: string | null;
+    last_result: string | null;
+    status: TaskStatus;
+    created_at: string;
+  }>;
 }
 
 export interface Env {
@@ -61,5 +116,6 @@ export interface Env {
   AGENT_RUNTIME_MODE?: 'stub' | 'http';
   AGENT_RUNTIME_HTTP_URL?: string;
   AGENT_QUEUE_MAX_ATTEMPTS?: string;
+  TIMEZONE?: string;
 }
 
