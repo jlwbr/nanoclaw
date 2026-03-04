@@ -1,0 +1,8 @@
+name = "nanoclaw-agent-runtime"
+main = "src/runtime-service.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[vars]
+APP_VERSION = "0.1.0"
+AGENT_RUNTIME_TIMEOUT_MS = "45000"
