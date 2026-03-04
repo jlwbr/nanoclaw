@@ -18,6 +18,15 @@ database_id = "REPLACE_WITH_D1_DATABASE_ID"
 name = "TENANT_ORCHESTRATOR"
 class_name = "TenantOrchestrator"
 
+[[queues.producers]]
+binding = "AGENT_RUN_QUEUE"
+queue = "nanoclaw-agent-runs"
+
+[[queues.consumers]]
+queue = "nanoclaw-agent-runs"
+max_batch_size = 10
+max_batch_timeout = 5
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TenantOrchestrator"]

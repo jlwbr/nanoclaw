@@ -1,5 +1,10 @@
 import { TenantOrchestrator } from './durable-objects/tenant-orchestrator';
-import { CanonicalInboundEvent, Env, TenantOrchestratorRequest } from './types';
+import {
+  AgentRunJobMessage,
+  CanonicalInboundEvent,
+  Env,
+  TenantOrchestratorRequest,
+} from './types';
 
 function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -121,6 +126,70 @@ async function routeInboundEvent(
   });
 }
 
+function parseRunJob(
+  body: unknown,
+): AgentRunJobMessage | null {
+  if (!body || typeof body !== 'object') return null;
+  const raw = body as Record<string, unknown>;
+  if (
+    typeof raw.runId !== 'string' ||
+    typeof raw.tenantId !== 'string' ||
+    typeof raw.eventId !== 'string' ||
+    typeof raw.channel !== 'string' ||
+    typeof raw.chatJid !== 'string' ||
+    typeof raw.enqueuedAt !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    runId: raw.runId,
+    tenantId: raw.tenantId,
+    eventId: raw.eventId,
+    channel: raw.channel,
+    chatJid: raw.chatJid,
+    content: typeof raw.content === 'string' ? raw.content : undefined,
+    enqueuedAt: raw.enqueuedAt,
+  };
+}
+
+async function updateRunStatus(
+  env: Env,
+  job: AgentRunJobMessage,
+  status: 'processing' | 'awaiting_runtime' | 'completed' | 'failed',
+  detail?: string,
+): Promise<void> {
+  const id = env.TENANT_ORCHESTRATOR.idFromName(job.tenantId);
+  const stub = env.TENANT_ORCHESTRATOR.get(id);
+
+  const requestBody: TenantOrchestratorRequest = {
+    type: 'run_status_update',
+    runId: job.runId,
+    tenantId: job.tenantId,
+    status,
+    detail,
+    processedAt: new Date().toISOString(),
+  };
+
+  await stub.fetch('https://tenant-orchestrator/events', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(requestBody),
+  });
+}
+
+async function processRunJob(env: Env, job: AgentRunJobMessage): Promise<void> {
+  await updateRunStatus(env, job, 'processing');
+
+  // Runtime invocation is implemented in a later phase.
+  // For now, mark the run as accepted by the queue pipeline.
+  await updateRunStatus(
+    env,
+    job,
+    'awaiting_runtime',
+    'Queue dispatch succeeded; runtime integration pending',
+  );
+}
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -172,6 +241,29 @@ export default {
     });
 
     return routeInboundEvent(env, canonical);
+  },
+  async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const parsed = parseRunJob(message.body);
+      if (!parsed) {
+        // Drop malformed payloads; they are not retriable.
+        message.ack();
+        continue;
+      }
+
+      try {
+        await processRunJob(env, parsed);
+        message.ack();
+      } catch (err) {
+        const runId = parsed.runId;
+        console.error('queue process failed', {
+          runId,
+          tenantId: parsed.tenantId,
+          err,
+        });
+        message.retry();
+      }
+    }
   },
 } satisfies ExportedHandler<Env>;
 

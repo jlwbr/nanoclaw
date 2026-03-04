@@ -1,4 +1,5 @@
 import {
+  AgentRunJobMessage,
   CanonicalInboundEvent,
   Env,
   TenantOrchestratorRequest,
@@ -45,16 +46,95 @@ export class TenantOrchestrator {
       return json({ error: 'Invalid JSON body' }, 400);
     }
 
-    if (body.type !== 'inbound_event' || !body.event) {
-      return json({ error: 'Unsupported request type' }, 400);
+    switch (body.type) {
+      case 'inbound_event': {
+        const event = body.event;
+        if (
+          !event.eventId ||
+          !event.tenantId ||
+          !event.channel ||
+          !event.receivedAt
+        ) {
+          return json({ error: 'Missing required event fields' }, 400);
+        }
+        return this.handleInboundEvent(event);
+      }
+      case 'run_status_update': {
+        if (
+          !body.runId ||
+          !body.tenantId ||
+          !body.status ||
+          !body.processedAt
+        ) {
+          return json({ error: 'Missing required run status fields' }, 400);
+        }
+        return this.handleRunStatusUpdate(body);
+      }
+      default:
+        return json({ error: 'Unsupported request type' }, 400);
+    }
+  }
+
+  private buildRunJob(event: CanonicalInboundEvent): AgentRunJobMessage {
+    return {
+      runId: crypto.randomUUID(),
+      tenantId: event.tenantId,
+      eventId: event.eventId,
+      channel: event.channel,
+      chatJid: event.chatJid,
+      content: event.content,
+      enqueuedAt: new Date().toISOString(),
+    };
+  }
+
+  private async handleRunStatusUpdate(body: {
+    runId: string;
+    tenantId: string;
+    status: 'processing' | 'awaiting_runtime' | 'completed' | 'failed';
+    detail?: string;
+    processedAt: string;
+  }): Promise<Response> {
+    const terminalStatus = body.status === 'completed' || body.status === 'failed';
+
+    const result = await this.env.DB.prepare(
+      `UPDATE agent_run_jobs
+       SET status = ?1,
+           last_error = CASE WHEN ?1 = 'failed' THEN COALESCE(?2, last_error) ELSE last_error END,
+           attempt_count = CASE
+             WHEN ?1 = 'processing' THEN attempt_count + 1
+             ELSE attempt_count
+           END,
+           started_at = CASE
+             WHEN ?1 = 'processing' AND started_at IS NULL THEN ?3
+             ELSE started_at
+           END,
+           finished_at = CASE
+             WHEN ?4 = 1 THEN ?3
+             ELSE finished_at
+           END,
+           updated_at = ?3
+       WHERE tenant_id = ?5 AND run_id = ?6`,
+    )
+      .bind(
+        body.status,
+        body.detail ?? null,
+        body.processedAt,
+        terminalStatus ? 1 : 0,
+        body.tenantId,
+        body.runId,
+      )
+      .run();
+
+    if ((result.meta.changes ?? 0) === 0) {
+      return json({ ok: false, error: 'Run not found' }, 404);
     }
 
-    const event = body.event;
-    if (!event.eventId || !event.tenantId || !event.channel || !event.receivedAt) {
-      return json({ error: 'Missing required event fields' }, 400);
-    }
-
-    return this.handleInboundEvent(event);
+    return json({
+      ok: true,
+      runId: body.runId,
+      tenantId: body.tenantId,
+      status: body.status,
+    });
   }
 
   private async handleInboundEvent(
@@ -77,6 +157,8 @@ export class TenantOrchestrator {
     await this.state.storage.put(dedupeKey, event.receivedAt);
 
     const now = new Date().toISOString();
+    const runJob = this.buildRunJob(event);
+
     await this.env.DB.batch([
       this.env.DB.prepare(
         `INSERT OR IGNORE INTO tenants (tenant_id, created_at, updated_at)
@@ -101,7 +183,45 @@ export class TenantOrchestrator {
         JSON.stringify(event.payload ?? {}),
         event.receivedAt,
       ),
+      this.env.DB.prepare(
+        `INSERT INTO agent_run_jobs (
+           tenant_id, run_id, event_id, channel, chat_jid, status, attempt_count, queued_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', 0, ?6, ?6)`,
+      ).bind(
+        event.tenantId,
+        runJob.runId,
+        event.eventId,
+        event.channel,
+        event.chatJid,
+        runJob.enqueuedAt,
+      ),
     ]);
+
+    try {
+      await this.env.AGENT_RUN_QUEUE.send(runJob);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      await this.env.DB.prepare(
+        `UPDATE agent_run_jobs
+         SET status = 'enqueue_failed', last_error = ?1, updated_at = ?2
+         WHERE tenant_id = ?3 AND run_id = ?4`,
+      )
+        .bind(message, new Date().toISOString(), event.tenantId, runJob.runId)
+        .run();
+
+      return json(
+        {
+          ok: false,
+          duplicate: false,
+          eventId: event.eventId,
+          tenantId: event.tenantId,
+          runId: runJob.runId,
+          message: 'Failed to enqueue agent run',
+          error: message,
+        },
+        500,
+      );
+    }
 
     const response: TenantOrchestratorResponse = {
       ok: true,
@@ -109,6 +229,7 @@ export class TenantOrchestrator {
       eventId: event.eventId,
       tenantId: event.tenantId,
       message: 'Event accepted',
+      runId: runJob.runId,
     };
 
     return json(response, 202);

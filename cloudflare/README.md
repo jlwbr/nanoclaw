@@ -8,10 +8,13 @@ This directory contains the first implementation slice for migrating NanoClaw to
   - health endpoint
   - webhook ingest endpoint (`POST /webhooks/:channel`)
   - canonical event normalization and forwarding to per-tenant Durable Object
+  - queue consumer for agent run dispatch lifecycle updates
 - Durable Object skeleton (`src/durable-objects/tenant-orchestrator.ts`) for:
   - idempotent event ingestion
   - basic persistence into D1
+  - enqueueing run jobs to Cloudflare Queues
 - Initial tenant-aware D1 schema migration (`d1/0001_tenant_core.sql`)
+- Queue run tracking schema migration (`d1/0002_agent_run_jobs.sql`)
 - Wrangler configuration scaffold (`wrangler.toml`)
 
 ## Why this is high-impact
@@ -26,7 +29,6 @@ This is the foundation that unblocks:
 
 This bootstrap is intentionally minimal and does **not** yet include:
 
-- queue-backed agent execution
 - Cloudflare Containers runtime invocation
 - channel-specific signature verification logic for each provider
 - outbound message delivery adapters
@@ -41,6 +43,7 @@ Those are tracked in `docs/CLOUDFLARE_EVENT_DRIVEN_ROADMAP.md`.
 
 ```bash
 wrangler d1 execute nanoclaw --file ./d1/0001_tenant_core.sql
+wrangler d1 execute nanoclaw --file ./d1/0002_agent_run_jobs.sql
 ```
 
 4. Start local dev server:
