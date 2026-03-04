@@ -5,6 +5,7 @@ This directory contains the first implementation slice for migrating NanoClaw to
 ## What is included
 
 - Worker entrypoint (`src/index.ts`) for:
+  - purchase/setup frontend (`GET /`) and checkout APIs (`/api/plans`, `POST /api/purchase`)
   - health endpoint
   - webhook ingest endpoint (`POST /webhooks/:channel`)
   - task management endpoints (`/tenants/:tenantId/tasks*`)
@@ -101,6 +102,12 @@ Primary wakeups happen with Durable Object alarms; cron is a fallback safety swe
 - `GET /tenants/:tenantId/usage` export token/cost ledger + daily aggregates
 - `GET /tenants/:tenantId/outbound` inspect delivery state
 - `POST /tenants/:tenantId/outbound/:deliveryId/redrive` re-drive dead-lettered outbound delivery
+
+## Agent purchase + setup UI
+
+- `GET /` serves a frontend site where users can choose a plan, "buy", and configure initial agent settings.
+- `GET /api/plans` returns available plan metadata.
+- `POST /api/purchase` validates checkout payload, provisions a tenant, applies plan limits, and returns setup commands.
 
 ## Local migration helpers
 
