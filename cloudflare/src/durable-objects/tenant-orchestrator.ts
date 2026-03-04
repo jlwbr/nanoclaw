@@ -3,6 +3,7 @@ import {
   CanonicalInboundEvent,
   Env,
   ListTasksRequest,
+  OutboundDeliveryMessage,
   ReconcileTasksRequest,
   ScheduleTaskRequest,
   TaskActionRequest,
@@ -184,6 +185,272 @@ export class TenantOrchestrator {
       .run();
   }
 
+  private async ensureTenantPolicyDefaults(tenantId: string): Promise<void> {
+    const now = new Date().toISOString();
+    await this.env.DB.prepare(
+      `INSERT OR IGNORE INTO tenant_limits (
+         tenant_id, requests_per_minute, token_budget_daily, max_concurrent_runs, hard_block, created_at, updated_at
+       ) VALUES (?1, 120, 1000000, 4, 0, ?2, ?2)`,
+    )
+      .bind(tenantId, now)
+      .run();
+  }
+
+  private estimateModelCostUsd(args: {
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    cachedInputTokens?: number;
+  }): number {
+    const inputTokens = args.inputTokens ?? 0;
+    const outputTokens = args.outputTokens ?? 0;
+    const cachedInputTokens = args.cachedInputTokens ?? 0;
+    const model = (args.model ?? '').toLowerCase();
+
+    const rates: Record<
+      string,
+      { inputPerM: number; outputPerM: number; cachedInputPerM?: number }
+    > = {
+      'gpt-4.1': { inputPerM: 2, outputPerM: 8, cachedInputPerM: 0.5 },
+      'gpt-4.1-mini': { inputPerM: 0.4, outputPerM: 1.6, cachedInputPerM: 0.1 },
+      'gpt-5': { inputPerM: 1.25, outputPerM: 10, cachedInputPerM: 0.125 },
+      'gpt-5-mini': { inputPerM: 0.25, outputPerM: 2, cachedInputPerM: 0.025 },
+      'claude-3-5-sonnet': { inputPerM: 3, outputPerM: 15 },
+      'claude-3-7-sonnet': { inputPerM: 3, outputPerM: 15 },
+      'claude-sonnet-4': { inputPerM: 3, outputPerM: 15 },
+      'claude-3-5-haiku': { inputPerM: 0.8, outputPerM: 4 },
+      'claude-haiku-4': { inputPerM: 0.8, outputPerM: 4 },
+    };
+
+    const matched = Object.entries(rates).find(([key]) =>
+      model.includes(key),
+    )?.[1] ?? {
+      inputPerM: 2,
+      outputPerM: 8,
+      cachedInputPerM: 0.5,
+    };
+
+    const cachedRate = matched.cachedInputPerM ?? matched.inputPerM;
+    const total =
+      (inputTokens / 1_000_000) * matched.inputPerM +
+      (outputTokens / 1_000_000) * matched.outputPerM +
+      (cachedInputTokens / 1_000_000) * cachedRate;
+    return Number(total.toFixed(8));
+  }
+
+  private async logSecurityEvent(args: {
+    tenantId: string;
+    eventType: string;
+    severity: 'info' | 'warn' | 'error';
+    detail?: string;
+    correlationId?: string;
+  }): Promise<void> {
+    await this.env.DB.prepare(
+      `INSERT INTO security_audit_logs (
+         tenant_id, event_type, severity, detail, correlation_id, created_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)`,
+    )
+      .bind(
+        args.tenantId,
+        args.eventType,
+        args.severity,
+        args.detail ?? null,
+        args.correlationId ?? null,
+        new Date().toISOString(),
+      )
+      .run();
+  }
+
+  private async appendTaskRunLog(args: {
+    tenantId: string;
+    taskId: string;
+    runAt: string;
+    status: 'success' | 'error';
+    result?: string;
+    error?: string;
+  }): Promise<void> {
+    await this.env.DB.prepare(
+      `INSERT INTO task_run_logs (
+         tenant_id, task_id, run_at, duration_ms, status, result, error
+       ) VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)`,
+    )
+      .bind(
+        args.tenantId,
+        args.taskId,
+        args.runAt,
+        args.status,
+        args.result ?? null,
+        args.error ?? null,
+      )
+      .run();
+  }
+
+  private async updateUsageLedger(args: {
+    tenantId: string;
+    runId: string;
+    model?: string;
+    usageInputTokens?: number;
+    usageOutputTokens?: number;
+    usageCachedInputTokens?: number;
+    completedAt: string;
+  }): Promise<void> {
+    await this.ensureTenantPolicyDefaults(args.tenantId);
+    const usageDate = args.completedAt.slice(0, 10);
+    const inputTokens = args.usageInputTokens ?? 0;
+    const outputTokens = args.usageOutputTokens ?? 0;
+    const cachedInputTokens = args.usageCachedInputTokens ?? 0;
+    const estimatedCostUsd = this.estimateModelCostUsd({
+      model: args.model,
+      inputTokens,
+      outputTokens,
+      cachedInputTokens,
+    });
+
+    await this.env.DB.batch([
+      this.env.DB.prepare(
+        `INSERT INTO usage_ledger (
+           tenant_id, run_id, usage_date, model, input_tokens, output_tokens, cached_input_tokens,
+           estimated_cost_usd, created_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?9)
+         ON CONFLICT(tenant_id, run_id) DO UPDATE SET
+           usage_date = excluded.usage_date,
+           model = excluded.model,
+           input_tokens = excluded.input_tokens,
+           output_tokens = excluded.output_tokens,
+           cached_input_tokens = excluded.cached_input_tokens,
+           estimated_cost_usd = excluded.estimated_cost_usd,
+           updated_at = excluded.updated_at`,
+      ).bind(
+        args.tenantId,
+        args.runId,
+        usageDate,
+        args.model ?? null,
+        inputTokens,
+        outputTokens,
+        cachedInputTokens,
+        estimatedCostUsd,
+        args.completedAt,
+      ),
+      this.env.DB.prepare(
+        `INSERT INTO tenant_daily_usage (
+           tenant_id, usage_date, input_tokens, output_tokens, cached_input_tokens, estimated_cost_usd, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT(tenant_id, usage_date) DO UPDATE SET
+           input_tokens = input_tokens + excluded.input_tokens,
+           output_tokens = output_tokens + excluded.output_tokens,
+           cached_input_tokens = cached_input_tokens + excluded.cached_input_tokens,
+           estimated_cost_usd = estimated_cost_usd + excluded.estimated_cost_usd,
+           updated_at = excluded.updated_at`,
+      ).bind(
+        args.tenantId,
+        usageDate,
+        inputTokens,
+        outputTokens,
+        cachedInputTokens,
+        estimatedCostUsd,
+        args.completedAt,
+      ),
+    ]);
+
+    const policy = await this.env.DB.prepare(
+      `SELECT token_budget_daily
+       FROM tenant_limits
+       WHERE tenant_id = ?1`,
+    )
+      .bind(args.tenantId)
+      .first<{ token_budget_daily: number }>();
+    const daily = await this.env.DB.prepare(
+      `SELECT input_tokens, output_tokens, cached_input_tokens
+       FROM tenant_daily_usage
+       WHERE tenant_id = ?1 AND usage_date = ?2`,
+    )
+      .bind(args.tenantId, usageDate)
+      .first<{
+        input_tokens: number;
+        output_tokens: number;
+        cached_input_tokens: number;
+      }>();
+
+    const usedTokens =
+      (daily?.input_tokens ?? 0) +
+      (daily?.output_tokens ?? 0) +
+      (daily?.cached_input_tokens ?? 0);
+    const tokenBudgetDaily = policy?.token_budget_daily ?? 0;
+    if (tokenBudgetDaily > 0 && usedTokens > tokenBudgetDaily) {
+      await this.logSecurityEvent({
+        tenantId: args.tenantId,
+        eventType: 'budget_exceeded',
+        severity: 'warn',
+        detail: `usage_date=${usageDate} used_tokens=${usedTokens} budget=${tokenBudgetDaily}`,
+        correlationId: args.runId,
+      });
+    }
+  }
+
+  private async enqueueOutboundReply(args: {
+    tenantId: string;
+    runId: string;
+    outputText: string;
+  }): Promise<void> {
+    const job = await this.env.DB.prepare(
+      `SELECT channel, chat_jid
+       FROM agent_run_jobs
+       WHERE tenant_id = ?1 AND run_id = ?2`,
+    )
+      .bind(args.tenantId, args.runId)
+      .first<{ channel: string; chat_jid: string }>();
+    if (!job) return;
+    if (job.channel === 'scheduled') return;
+
+    const deliveryId = crypto.randomUUID();
+    const message: OutboundDeliveryMessage = {
+      deliveryId,
+      tenantId: args.tenantId,
+      runId: args.runId,
+      channel: job.channel,
+      chatJid: job.chat_jid,
+      text: args.outputText,
+      enqueuedAt: new Date().toISOString(),
+    };
+
+    await this.env.DB.prepare(
+      `INSERT INTO outbound_deliveries (
+         tenant_id, delivery_id, run_id, channel, chat_jid, payload_json,
+         status, attempt_count, queued_at, updated_at
+       ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', 0, ?7, ?7)`,
+    )
+      .bind(
+        message.tenantId,
+        message.deliveryId,
+        message.runId,
+        message.channel,
+        message.chatJid,
+        JSON.stringify({ text: message.text }),
+        message.enqueuedAt,
+      )
+      .run();
+
+    try {
+      await this.env.OUTBOUND_QUEUE.send(message);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      await this.env.DB.prepare(
+        `UPDATE outbound_deliveries
+         SET status = 'enqueue_failed', last_error = ?1, updated_at = ?2
+         WHERE tenant_id = ?3 AND delivery_id = ?4`,
+      )
+        .bind(detail, new Date().toISOString(), args.tenantId, deliveryId)
+        .run();
+      await this.logSecurityEvent({
+        tenantId: args.tenantId,
+        eventType: 'outbound_enqueue_failed',
+        severity: 'error',
+        detail,
+        correlationId: args.runId,
+      });
+    }
+  }
+
   private async refreshAlarmForTenant(tenantId: string): Promise<void> {
     const row = await this.env.DB.prepare(
       `SELECT next_run
@@ -248,6 +515,35 @@ export class TenantOrchestrator {
       throw new EnqueueRunError(runJob.runId, message);
     }
     return runJob;
+  }
+
+  private async shouldTriggerRun(
+    event: CanonicalInboundEvent,
+  ): Promise<boolean> {
+    const group = await this.env.DB.prepare(
+      `SELECT requires_trigger, is_main, trigger_pattern
+       FROM registered_groups
+       WHERE tenant_id = ?1 AND jid = ?2`,
+    )
+      .bind(event.tenantId, event.chatJid)
+      .first<{
+        requires_trigger: number | null;
+        is_main: number | null;
+        trigger_pattern: string | null;
+      }>();
+
+    if (!group) return true;
+    if ((group.is_main ?? 0) === 1) return true;
+    if ((group.requires_trigger ?? 1) !== 1) return true;
+    if (!event.content) return false;
+
+    const pattern = group.trigger_pattern;
+    if (!pattern) return false;
+    try {
+      return new RegExp(pattern, 'i').test(event.content);
+    } catch {
+      return event.content.toLowerCase().includes(pattern.toLowerCase());
+    }
   }
 
   private async createSyntheticTaskEvent(args: {
@@ -542,7 +838,11 @@ export class TenantOrchestrator {
            SET last_result = ?1
            WHERE tenant_id = ?2 AND id = ?3`,
         )
-          .bind(`Run-now enqueue failed: ${message}`, body.tenantId, body.taskId)
+          .bind(
+            `Run-now enqueue failed: ${message}`,
+            body.tenantId,
+            body.taskId,
+          )
           .run();
         return json({ ok: false, error: message }, 500);
       }
@@ -649,6 +949,13 @@ export class TenantOrchestrator {
             task.id,
           )
           .run();
+        await this.appendTaskRunLog({
+          tenantId,
+          taskId: task.id,
+          runAt: nowIso,
+          status: 'success',
+          result: `Enqueued run ${runJob.runId}`,
+        });
         enqueuedCount += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
@@ -681,6 +988,13 @@ export class TenantOrchestrator {
             task.id,
           )
           .run();
+        await this.appendTaskRunLog({
+          tenantId,
+          taskId: task.id,
+          runAt: nowIso,
+          status: 'error',
+          error: message,
+        });
       }
     }
 
@@ -706,7 +1020,8 @@ export class TenantOrchestrator {
     usageCachedInputTokens?: number;
     runtimeMs?: number;
   }): Promise<Response> {
-    const terminalStatus = body.status === 'completed' || body.status === 'failed';
+    const terminalStatus =
+      body.status === 'completed' || body.status === 'failed';
 
     const result = await this.env.DB.prepare(
       `UPDATE agent_run_jobs
@@ -772,6 +1087,24 @@ export class TenantOrchestrator {
           body.processedAt,
         )
         .run();
+
+      await this.updateUsageLedger({
+        tenantId: body.tenantId,
+        runId: body.runId,
+        model: body.model,
+        usageInputTokens: body.usageInputTokens,
+        usageOutputTokens: body.usageOutputTokens,
+        usageCachedInputTokens: body.usageCachedInputTokens,
+        completedAt: body.processedAt,
+      });
+
+      if (body.outputText) {
+        await this.enqueueOutboundReply({
+          tenantId: body.tenantId,
+          runId: body.runId,
+          outputText: body.outputText,
+        });
+      }
     }
 
     return json({
@@ -830,6 +1163,17 @@ export class TenantOrchestrator {
       ),
     ]);
 
+    if (!(await this.shouldTriggerRun(event))) {
+      const response: TenantOrchestratorResponse = {
+        ok: true,
+        duplicate: false,
+        eventId: event.eventId,
+        tenantId: event.tenantId,
+        message: 'Event stored; trigger condition not met',
+      };
+      return json(response, 202);
+    }
+
     let runId: string | undefined;
     try {
       const runJob = await this.enqueueFromEvent(event);
@@ -866,4 +1210,3 @@ export class TenantOrchestrator {
     return json(response, 202);
   }
 }
-

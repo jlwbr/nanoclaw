@@ -1,7 +1,14 @@
 APP_ENV=dev
 WEBHOOK_SHARED_SECRET=replace-with-dev-shared-secret
+SLACK_SIGNING_SECRET=replace-with-slack-secret
+TELEGRAM_WEBHOOK_SECRET=replace-with-telegram-secret
+DISCORD_WEBHOOK_SECRET=replace-with-discord-secret
 AGENT_RUNTIME_MODE=stub
 # AGENT_RUNTIME_HTTP_URL=https://runtime.example.com/execute
 AGENT_QUEUE_MAX_ATTEMPTS=5
+OUTBOUND_MODE=stub
+# OUTBOUND_HTTP_URL=https://outbound.example.com/send
+OUTBOUND_ALLOWED_CHANNELS=slack,telegram,discord
+OUTBOUND_QUEUE_MAX_ATTEMPTS=5
 TIMEZONE=UTC
 

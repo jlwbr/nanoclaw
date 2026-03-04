@@ -20,6 +20,16 @@ export interface AgentRunJobMessage {
   enqueuedAt: string;
 }
 
+export interface OutboundDeliveryMessage {
+  deliveryId: string;
+  tenantId: string;
+  runId: string;
+  channel: string;
+  chatJid: string;
+  text: string;
+  enqueuedAt: string;
+}
+
 export type TaskScheduleType = 'cron' | 'interval' | 'once';
 export type TaskStatus = 'active' | 'paused' | 'completed';
 export type TaskContextMode = 'group' | 'isolated';
@@ -110,12 +120,21 @@ export interface TenantOrchestratorResponse {
 export interface Env {
   TENANT_ORCHESTRATOR: DurableObjectNamespace;
   AGENT_RUN_QUEUE: Queue<AgentRunJobMessage>;
+  OUTBOUND_QUEUE: Queue<OutboundDeliveryMessage>;
   DB: D1Database;
+  TENANT_FILES?: R2Bucket;
+  AGENT_RUNTIME?: Fetcher;
   APP_ENV?: string;
   WEBHOOK_SHARED_SECRET?: string;
-  AGENT_RUNTIME_MODE?: 'stub' | 'http';
+  SLACK_SIGNING_SECRET?: string;
+  TELEGRAM_WEBHOOK_SECRET?: string;
+  DISCORD_WEBHOOK_SECRET?: string;
+  AGENT_RUNTIME_MODE?: 'stub' | 'http' | 'service';
   AGENT_RUNTIME_HTTP_URL?: string;
   AGENT_QUEUE_MAX_ATTEMPTS?: string;
+  OUTBOUND_MODE?: 'stub' | 'http';
+  OUTBOUND_HTTP_URL?: string;
+  OUTBOUND_ALLOWED_CHANNELS?: string;
+  OUTBOUND_QUEUE_MAX_ATTEMPTS?: string;
   TIMEZONE?: string;
 }
-

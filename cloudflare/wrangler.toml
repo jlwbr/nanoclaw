@@ -11,6 +11,10 @@ APP_ENV = "dev"
 AGENT_RUNTIME_MODE = "stub"
 # AGENT_RUNTIME_HTTP_URL = "https://runtime.example.com/execute"
 AGENT_QUEUE_MAX_ATTEMPTS = "5"
+OUTBOUND_MODE = "stub"
+# OUTBOUND_HTTP_URL = "https://outbound.example.com/send"
+OUTBOUND_ALLOWED_CHANNELS = "slack,telegram,discord"
+OUTBOUND_QUEUE_MAX_ATTEMPTS = "5"
 TIMEZONE = "UTC"
 
 [triggers]
@@ -30,14 +34,49 @@ class_name = "TenantOrchestrator"
 binding = "AGENT_RUN_QUEUE"
 queue = "nanoclaw-agent-runs"
 
+[[queues.producers]]
+binding = "OUTBOUND_QUEUE"
+queue = "nanoclaw-outbound"
+
 [[queues.consumers]]
 queue = "nanoclaw-agent-runs"
 max_batch_size = 10
 max_batch_timeout = 5
 
+[[queues.consumers]]
+queue = "nanoclaw-outbound"
+max_batch_size = 20
+max_batch_timeout = 5
+
+[[r2_buckets]]
+binding = "TENANT_FILES"
+bucket_name = "nanoclaw-tenant-files"
+
+[[services]]
+binding = "AGENT_RUNTIME"
+service = "nanoclaw-agent-runtime"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["TenantOrchestrator"]
+
+[env.staging.vars]
+APP_ENV = "staging"
+AGENT_RUNTIME_MODE = "service"
+AGENT_QUEUE_MAX_ATTEMPTS = "5"
+OUTBOUND_MODE = "http"
+OUTBOUND_ALLOWED_CHANNELS = "slack,telegram,discord"
+OUTBOUND_QUEUE_MAX_ATTEMPTS = "8"
+TIMEZONE = "UTC"
+
+[env.prod.vars]
+APP_ENV = "prod"
+AGENT_RUNTIME_MODE = "service"
+AGENT_QUEUE_MAX_ATTEMPTS = "5"
+OUTBOUND_MODE = "http"
+OUTBOUND_ALLOWED_CHANNELS = "slack,telegram,discord"
+OUTBOUND_QUEUE_MAX_ATTEMPTS = "8"
+TIMEZONE = "UTC"
 
 # Future phases:
 # - Add queue producer/consumer bindings for agent run jobs
