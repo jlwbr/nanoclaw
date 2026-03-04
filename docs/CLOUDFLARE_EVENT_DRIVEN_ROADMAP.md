@@ -1,8 +1,24 @@
 # NanoClaw Cloudflare Event-Driven Migration Roadmap
 
-Status: Draft v1  
+Status: Implemented v2 (Cloudflare event-driven baseline complete)  
 Owner: Platform/Infra  
 Last updated: 2026-03-03
+
+## Implementation status (this repository)
+
+- [x] Phase 0 foundations (ADR + security boundary docs)
+- [x] Phase 1 bootstrap (Worker config, envs, bindings, CI workflow, secrets rotation procedure)
+- [x] Phase 2 tenant data model + migration helpers + R2 key abstraction
+- [x] Phase 3 ingress normalization/validation pipeline with idempotent routing
+- [x] Phase 4 durable orchestration and queue handoff
+- [x] Phase 5 scheduler migration (DO alarms + cron reconciliation + task CRUD/logging)
+- [x] Phase 6 runtime execution abstraction with service/HTTP/stub modes and runtime contracts
+- [x] Phase 7 no filesystem IPC dependency in Cloudflare path
+- [x] Phase 8 outbound adapters, retries, dead-letter, and re-drive API
+- [x] Phase 9 tenant isolation controls, ingress guardrails, quotas, and audit logs
+- [x] Phase 10 token usage ledger, cost estimation, budget enforcement, usage export
+- [x] Phase 11 structured logging + metrics endpoint + on-call runbook
+- [x] Phase 12 rollout/cutover runbook (shadow, canary, progressive rollout, rollback)
 
 ---
 
@@ -360,17 +376,17 @@ The target architecture removes polling and host-local assumptions.
 
 ## 6) Module-by-module migration map
 
-| Current module | Action | Target |
-|---|---|---|
-| `src/index.ts` | Decompose and replace polling startup | Worker route + DO handlers |
-| `src/db.ts` | Replace local SQLite driver | D1 repository layer |
-| `src/group-queue.ts` | Re-implement queue semantics | DO state + Queues |
-| `src/ipc.ts` | Remove filesystem IPC | DO commands + queue callbacks |
-| `src/task-scheduler.ts` | Port logic | DO alarms + Cron reconciler |
-| `src/container-runner.ts` | Rewrite execution transport | Cloudflare Containers invocation |
-| `src/container-runtime.ts` | Retire local Docker coupling | Container binding abstraction |
-| `src/channels/*` | Replace long-lived connectors | Webhook adapters + outbound clients |
-| `container/agent-runner/*` | Adapt for stateless cloud invocations | runtime request/response contract |
+| Current module             | Action                                | Target                              |
+| -------------------------- | ------------------------------------- | ----------------------------------- |
+| `src/index.ts`             | Decompose and replace polling startup | Worker route + DO handlers          |
+| `src/db.ts`                | Replace local SQLite driver           | D1 repository layer                 |
+| `src/group-queue.ts`       | Re-implement queue semantics          | DO state + Queues                   |
+| `src/ipc.ts`               | Remove filesystem IPC                 | DO commands + queue callbacks       |
+| `src/task-scheduler.ts`    | Port logic                            | DO alarms + Cron reconciler         |
+| `src/container-runner.ts`  | Rewrite execution transport           | Cloudflare Containers invocation    |
+| `src/container-runtime.ts` | Retire local Docker coupling          | Container binding abstraction       |
+| `src/channels/*`           | Replace long-lived connectors         | Webhook adapters + outbound clients |
+| `container/agent-runner/*` | Adapt for stateless cloud invocations | runtime request/response contract   |
 
 ---
 
@@ -440,4 +456,3 @@ Migration is complete when all are true:
 - all tenant state and artifacts stored in Cloudflare-managed services
 - token usage and billing ledger available per tenant
 - canary and full-rollout SLOs met for 30 consecutive days
-
