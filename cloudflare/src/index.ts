@@ -6,6 +6,15 @@ import { TenantOrchestrator } from './durable-objects/tenant-orchestrator';
 import { normalizeInboundEvent } from './events/normalize';
 import { verifyInboundSignature } from './events/validate';
 import {
+  AGENT_PLANS,
+  buildSetupGuide,
+  createOrderId,
+  createTenantId,
+  getPlanById,
+  parsePurchasePayload,
+  renderPurchasePage,
+} from './frontend/site';
+import {
   AgentRunJobMessage,
   CanonicalInboundEvent,
   Env,
@@ -471,6 +480,90 @@ async function processRunJob(
 }
 
 const app = new Hono<{ Bindings: Env }>();
+
+app.get('/', (c) => c.html(renderPurchasePage()));
+
+app.get('/api/plans', (c) => c.json({ plans: AGENT_PLANS }));
+
+app.post('/api/purchase', async (c) => {
+  let payload: unknown;
+  try {
+    payload = await c.req.json();
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const parsed = parsePurchasePayload(payload);
+  if (!parsed.ok) {
+    return c.json({ error: parsed.error }, 400);
+  }
+
+  const plan = getPlanById(parsed.value.planId);
+  if (!plan) {
+    return c.json({ error: 'Selected plan is invalid' }, 400);
+  }
+
+  const tenantId = createTenantId({
+    company: parsed.value.company,
+    email: parsed.value.email,
+  });
+  await ensureTenantSetup(c.env, tenantId);
+
+  const now = new Date().toISOString();
+  await c.env.DB.prepare(
+    `UPDATE tenant_limits
+     SET requests_per_minute = ?1,
+         token_budget_daily = ?2,
+         max_concurrent_runs = ?3,
+         updated_at = ?4
+     WHERE tenant_id = ?5`,
+  )
+    .bind(
+      plan.limits.requestsPerMinute,
+      plan.limits.tokenBudgetDaily,
+      plan.limits.maxConcurrentRuns,
+      now,
+      tenantId,
+    )
+    .run();
+
+  await insertSecurityAudit({
+    env: c.env,
+    tenantId,
+    eventType: 'checkout_completed',
+    severity: 'info',
+    detail: `plan=${plan.id}`,
+  });
+
+  const setup = buildSetupGuide({
+    origin: new URL(c.req.url).origin,
+    tenantId,
+    assistantName: parsed.value.assistantName,
+    channels: parsed.value.channels,
+    timezone: parsed.value.timezone,
+    plan,
+  });
+
+  return c.json(
+    {
+      ok: true,
+      orderId: createOrderId(),
+      tenantId,
+      customer: {
+        fullName: parsed.value.fullName,
+        email: parsed.value.email,
+        company: parsed.value.company,
+      },
+      plan: {
+        id: plan.id,
+        name: plan.name,
+        priceUsdMonthly: plan.priceUsdMonthly,
+      },
+      setup,
+    },
+    201,
+  );
+});
 
 app.get('/health', (c) =>
   c.json({
