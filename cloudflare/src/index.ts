@@ -1,3 +1,5 @@
+import { Hono } from 'hono';
+
 import { TenantOrchestrator } from './durable-objects/tenant-orchestrator';
 import {
   AgentRunJobMessage,
@@ -5,21 +7,6 @@ import {
   Env,
   TenantOrchestratorRequest,
 } from './types';
-
-function json(data: unknown, status = 200): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8' },
-  });
-}
-
-function normalizeChannel(pathname: string): string | null {
-  const parts = pathname.split('/').filter(Boolean);
-  if (parts.length === 2 && parts[0] === 'webhooks' && parts[1]) {
-    return parts[1];
-  }
-  return null;
-}
 
 async function sha256Hex(input: string): Promise<string> {
   const data = new TextEncoder().encode(input);
@@ -190,58 +177,65 @@ async function processRunJob(env: Env, job: AgentRunJobMessage): Promise<void> {
   );
 }
 
+const app = new Hono<{ Bindings: Env }>();
+
+app.get('/health', (c) =>
+  c.json({
+    ok: true,
+    service: 'nanoclaw-event-driven',
+    env: c.env.APP_ENV ?? 'unknown',
+  }),
+);
+
+app.on(
+  ['GET', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  '/webhooks/:channel',
+  (c) => c.json({ error: 'Method not allowed' }, 405),
+);
+
+app.post('/webhooks/:channel', async (c) => {
+  const channel = c.req.param('channel');
+  const tenantId = c.req.header('x-tenant-id');
+  if (!tenantId) {
+    return c.json({ error: 'Missing x-tenant-id header' }, 400);
+  }
+
+  const rawBody = await c.req.text();
+  if (!(await verifySharedSignature(c.req.raw, c.env, rawBody))) {
+    return c.json({ error: 'Invalid webhook signature' }, 401);
+  }
+
+  let payload: Record<string, unknown>;
+  try {
+    payload = JSON.parse(rawBody) as Record<string, unknown>;
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  const eventIdHeader = c.req.header('x-event-id');
+  const eventId =
+    eventIdHeader ?? (await sha256Hex(`${tenantId}:${channel}:${rawBody}`)).slice(0, 32);
+
+  const canonical = buildCanonicalEvent({
+    tenantId,
+    channel,
+    eventId,
+    payload,
+  });
+
+  const response = await routeInboundEvent(c.env, canonical);
+  return response;
+});
+
+app.notFound((c) => c.json({ error: 'Not found' }, 404));
+
+app.onError((err, c) => {
+  console.error('request failed', err);
+  return c.json({ error: 'Internal server error' }, 500);
+});
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    const url = new URL(request.url);
-
-    if (request.method === 'GET' && url.pathname === '/health') {
-      return json({
-        ok: true,
-        service: 'nanoclaw-event-driven',
-        env: env.APP_ENV ?? 'unknown',
-      });
-    }
-
-    const channel = normalizeChannel(url.pathname);
-    if (!channel) {
-      return json({ error: 'Not found' }, 404);
-    }
-
-    if (request.method !== 'POST') {
-      return json({ error: 'Method not allowed' }, 405);
-    }
-
-    const tenantId = request.headers.get('x-tenant-id');
-    if (!tenantId) {
-      return json({ error: 'Missing x-tenant-id header' }, 400);
-    }
-
-    const rawBody = await request.text();
-    if (!(await verifySharedSignature(request, env, rawBody))) {
-      return json({ error: 'Invalid webhook signature' }, 401);
-    }
-
-    let payload: Record<string, unknown>;
-    try {
-      payload = JSON.parse(rawBody) as Record<string, unknown>;
-    } catch {
-      return json({ error: 'Invalid JSON body' }, 400);
-    }
-
-    const eventIdHeader = request.headers.get('x-event-id');
-    const eventId =
-      eventIdHeader ??
-      (await sha256Hex(`${tenantId}:${channel}:${rawBody}`)).slice(0, 32);
-
-    const canonical = buildCanonicalEvent({
-      tenantId,
-      channel,
-      eventId,
-      payload,
-    });
-
-    return routeInboundEvent(env, canonical);
-  },
+  fetch: app.fetch,
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
     for (const message of batch.messages) {
       const parsed = parseRunJob(message.body);
