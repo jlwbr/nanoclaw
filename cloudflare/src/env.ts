@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   D1Database,
   DurableObjectNamespace,
+  Fetcher,
   Queue,
   R2Bucket,
 } from './cf-types.js';
@@ -16,6 +17,7 @@ export interface AgentRuntimeServiceBinding {
 export interface WorkerEnv {
   DB: D1Database;
   ARTIFACTS: R2Bucket;
+  ASSETS?: Fetcher;
   TENANT_ORCHESTRATOR: DurableObjectNamespace;
   AGENT_RUN_QUEUE: Queue<AgentRunRequest>;
   OUTBOUND_DELIVERY_QUEUE: Queue<Record<string, unknown>>;

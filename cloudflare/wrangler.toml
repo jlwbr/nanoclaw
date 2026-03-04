@@ -3,6 +3,10 @@ main = "src/index.ts"
 compatibility_date = "2025-11-01"
 compatibility_flags = ["nodejs_compat"]
 
+[assets]
+directory = "web/dist"
+binding = "ASSETS"
+
 [vars]
 AGENT_RUNTIME_MODE = "service"
 APP_VERSION = "0.1.0"

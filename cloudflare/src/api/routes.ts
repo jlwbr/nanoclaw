@@ -11,7 +11,6 @@ import { createPlatform } from '../factory.js';
 import { logError } from '../logging.js';
 import { getMetricSnapshot, incrementCounter, recordTiming } from '../metrics.js';
 import { verifyHmacSignature } from '../security.js';
-import { APP_JS, renderAppHtml } from '../ui/app.js';
 import { createId, jsonResponse, safeJsonParse, stableNowIso } from '../utils.js';
 
 const CreateTaskSchema = z.object({
@@ -24,24 +23,29 @@ const BillingPortalSchema = z.object({
   returnUrl: z.string().url(),
 });
 
-function textResponse(text: string, init: ResponseInit = {}): Response {
-  const headers = new Headers(init.headers);
-  headers.set('content-type', 'text/html; charset=utf-8');
-  return new Response(text, {
-    ...init,
-    headers,
-  });
-}
+const SetupTenantSchema = z.object({
+  tenantId: z.string().min(1),
+  displayName: z.string().min(1).optional(),
+  externalRef: z.string().min(1).optional(),
+  email: z.string().email().optional(),
+});
 
-function jsResponse(script: string): Response {
-  return new Response(script, {
-    status: 200,
-    headers: {
-      'content-type': 'application/javascript; charset=utf-8',
-      'cache-control': 'public, max-age=60',
-    },
-  });
-}
+const SetupStarterTaskSchema = z.object({
+  tenantId: z.string().min(1),
+  prompt: z.string().min(1),
+  scheduleType: z.enum(['cron', 'interval', 'once']),
+  scheduleValue: z.string().min(1),
+});
+
+const SetupBillingCustomerSchema = z.object({
+  tenantId: z.string().min(1),
+  externalRef: z.string().min(1).optional(),
+  email: z.string().email().optional(),
+});
+
+const SetupFinishSchema = z.object({
+  tenantId: z.string().min(1),
+});
 
 function parseTenantRoute(pathname: string): {
   tenantId: string;
@@ -71,6 +75,14 @@ function buildCorrelation(request: Request, tenantId?: string): {
   };
 }
 
+function isApiOrSystemPath(pathname: string): boolean {
+  return (
+    pathname.startsWith('/api/') ||
+    pathname === '/health' ||
+    pathname.startsWith('/webhook/')
+  );
+}
+
 export async function handleApiRequest(
   request: Request,
   env: WorkerEnv,
@@ -85,11 +97,12 @@ export async function handleApiRequest(
   });
 
   try {
-    if (request.method === 'GET' && pathname === '/') {
-      return textResponse(renderAppHtml());
-    }
-    if (request.method === 'GET' && pathname === '/app.js') {
-      return jsResponse(APP_JS);
+    if (
+      request.method === 'GET' &&
+      !isApiOrSystemPath(pathname) &&
+      env.ASSETS
+    ) {
+      return env.ASSETS.fetch(request);
     }
 
     if (request.method === 'GET' && pathname === '/health') {
@@ -103,6 +116,21 @@ export async function handleApiRequest(
         },
         metrics: getMetricSnapshot(),
       });
+    }
+
+    if (
+      request.method === 'GET' &&
+      !isApiOrSystemPath(pathname) &&
+      !env.ASSETS
+    ) {
+      return jsonResponse(
+        {
+          status: 'frontend_not_configured',
+          message:
+            'Vite frontend assets are not bound. Build cloudflare/web and configure ASSETS binding.',
+        },
+        { status: pathname === '/' ? 200 : 404 },
+      );
     }
 
     if (request.method === 'POST' && pathname === '/webhook/inbound') {
@@ -158,6 +186,143 @@ export async function handleApiRequest(
       );
       await platform.billing.applyWebhookEvent(event);
       return jsonResponse({ accepted: true, id: event.id, type: event.type });
+    }
+
+    if (request.method === 'POST' && pathname === '/api/setup/tenant') {
+      const body = await request.json();
+      const parsed = parseContract(SetupTenantSchema, body, 'SetupTenantRequest');
+      const now = stableNowIso();
+      await platform.repos.tenants.upsert({
+        tenantId: parsed.tenantId,
+        displayName: parsed.displayName ?? parsed.tenantId,
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      let customer: Awaited<ReturnType<typeof platform.billing.ensureCustomer>> | null =
+        null;
+      if (parsed.email || parsed.externalRef) {
+        customer = await platform.billing.ensureCustomer(parsed.tenantId, {
+          email: parsed.email,
+          externalRef: parsed.externalRef ?? parsed.tenantId,
+        });
+      }
+
+      const tenant = await platform.repos.tenants.get(parsed.tenantId);
+      return jsonResponse({
+        tenant,
+        customer,
+        nextStep: 'starter_task',
+      });
+    }
+
+    if (request.method === 'POST' && pathname === '/api/setup/starter-task') {
+      const body = await request.json();
+      const parsed = parseContract(
+        SetupStarterTaskSchema,
+        body,
+        'SetupStarterTaskRequest',
+      );
+      await platform.orchestration.ensureTenantExists(parsed.tenantId);
+      const taskId = createId('task');
+      const now = stableNowIso();
+      const nextRunAt =
+        parsed.scheduleType === 'once' ? parsed.scheduleValue : now;
+
+      await platform.repos.tasks.create({
+        taskId,
+        tenantId: parsed.tenantId,
+        prompt: parsed.prompt,
+        scheduleType: parsed.scheduleType,
+        scheduleValue: parsed.scheduleValue,
+        nextRunAt,
+        status: 'active',
+        createdAt: now,
+        updatedAt: now,
+      });
+      await platform.orchestration.enqueueDueTasks(
+        parsed.tenantId,
+        new Date().toISOString(),
+      );
+      return jsonResponse({ taskId, createdAt: now, nextStep: 'billing' }, { status: 201 });
+    }
+
+    if (
+      request.method === 'POST' &&
+      pathname === '/api/setup/billing/customer'
+    ) {
+      const body = await request.json();
+      const parsed = parseContract(
+        SetupBillingCustomerSchema,
+        body,
+        'SetupBillingCustomerRequest',
+      );
+      await platform.orchestration.ensureTenantExists(parsed.tenantId);
+      const customer = await platform.billing.ensureCustomer(parsed.tenantId, {
+        email: parsed.email,
+        externalRef: parsed.externalRef ?? parsed.tenantId,
+      });
+      const subscription = await platform.billing.fetchSubscriptionStatus(
+        parsed.tenantId,
+      );
+      return jsonResponse({ customer, subscription, nextStep: 'finish' });
+    }
+
+    if (request.method === 'GET' && pathname === '/api/setup/status') {
+      const tenantId = url.searchParams.get('tenantId');
+      if (!tenantId) {
+        throw new AppError({
+          code: 'INVALID_REQUEST',
+          message: 'tenantId query param is required',
+          status: 400,
+          retryable: false,
+        });
+      }
+      await platform.orchestration.ensureTenantExists(tenantId);
+      const [tenant, tasks, runtimeHealth, billingSummary] = await Promise.all([
+        platform.repos.tenants.get(tenantId),
+        platform.repos.tasks.listByTenant(tenantId, 200),
+        platform.runtime.healthcheck(),
+        platform.billing.getSummary(tenantId),
+      ]);
+      const activeTasks = tasks.filter((task) => task.status === 'active');
+      return jsonResponse({
+        tenant,
+        setup: {
+          hasStarterTask: activeTasks.length > 0,
+          activeTaskCount: activeTasks.length,
+        },
+        runtime: runtimeHealth,
+        billing: {
+          customer: billingSummary.customer,
+          subscription: billingSummary.subscription,
+        },
+        webhook: {
+          ingestUrl: `${url.origin}/webhook/inbound`,
+          signatureHeader: 'x-nanoclaw-signature',
+        },
+      });
+    }
+
+    if (request.method === 'POST' && pathname === '/api/setup/finish') {
+      const body = await request.json();
+      const parsed = parseContract(SetupFinishSchema, body, 'SetupFinishRequest');
+      const statusUrl = new URL('/api/setup/status', url.origin);
+      statusUrl.searchParams.set('tenantId', parsed.tenantId);
+      const statusResponse = await handleApiRequest(
+        new Request(statusUrl.toString(), { method: 'GET' }),
+        env,
+      );
+      const statusBody = await statusResponse.json();
+      const ready =
+        statusResponse.ok &&
+        statusBody.runtime?.status !== 'down' &&
+        Boolean(statusBody.setup?.hasStarterTask);
+      return jsonResponse({
+        ready,
+        status: statusBody,
+      });
     }
 
     const tenantRoute = parseTenantRoute(pathname);

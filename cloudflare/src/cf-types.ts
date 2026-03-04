@@ -104,3 +104,7 @@ export interface MessageBatch<T = unknown> {
 export interface ExecutionContext {
   waitUntil(promise: Promise<unknown>): void;
 }
+
+export interface Fetcher {
+  fetch(request: Request): Promise<Response>;
+}

@@ -11,7 +11,7 @@ This module adds an additive Cloudflare-native hosted runtime without changing t
 - **Artifacts**: R2 adapter (`src/adapters/r2-artifacts.ts`)
 - **Runtime**: Cloudflare service binding `AGENT_RUNTIME` (HTTP fallback in local/dev)
 - **Billing**: Autumn adapter (`src/adapters/autumn-billing.ts`)
-- **Frontend**: Minimal hosted UI from Worker routes (`/` + `/app.js`)
+- **Frontend**: Vite setup flow app in `web/` (served by Worker `ASSETS` binding when deployed)
 
 ## Commands
 
@@ -19,13 +19,22 @@ This module adds an additive Cloudflare-native hosted runtime without changing t
   - `npm run build:cloudflare`
 - Run hosted test suite:
   - `npm run test:cloudflare`
+- Run Vite setup app:
+  - `npm --prefix cloudflare/web run dev`
+- Build Vite setup app:
+  - `npm --prefix cloudflare/web run build`
 
 ## API surface
 
 - `GET /health`
 - `POST /webhook/inbound`
 - `POST /webhook/billing/autumn`
-- `GET /api/tenants/:tenantId/dashboard`
+- Setup flow APIs:
+  - `POST /api/setup/tenant`
+  - `POST /api/setup/starter-task`
+  - `POST /api/setup/billing/customer`
+  - `GET /api/setup/status?tenantId=...`
+  - `POST /api/setup/finish`
 - Task APIs:
   - `GET /api/tenants/:tenantId/tasks`
   - `POST /api/tenants/:tenantId/tasks`
