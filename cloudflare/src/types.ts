@@ -32,6 +32,13 @@ export interface RunStatusUpdateRequest {
   status: 'processing' | 'awaiting_runtime' | 'completed' | 'failed';
   detail?: string;
   processedAt: string;
+  outputText?: string;
+  output?: unknown;
+  model?: string;
+  usageInputTokens?: number;
+  usageOutputTokens?: number;
+  usageCachedInputTokens?: number;
+  runtimeMs?: number;
 }
 
 export type TenantOrchestratorRequest = InboundEventRequest | RunStatusUpdateRequest;
@@ -51,5 +58,8 @@ export interface Env {
   DB: D1Database;
   APP_ENV?: string;
   WEBHOOK_SHARED_SECRET?: string;
+  AGENT_RUNTIME_MODE?: 'stub' | 'http';
+  AGENT_RUNTIME_HTTP_URL?: string;
+  AGENT_QUEUE_MAX_ATTEMPTS?: string;
 }
 

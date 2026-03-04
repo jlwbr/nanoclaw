@@ -93,6 +93,13 @@ export class TenantOrchestrator {
     status: 'processing' | 'awaiting_runtime' | 'completed' | 'failed';
     detail?: string;
     processedAt: string;
+    outputText?: string;
+    output?: unknown;
+    model?: string;
+    usageInputTokens?: number;
+    usageOutputTokens?: number;
+    usageCachedInputTokens?: number;
+    runtimeMs?: number;
   }): Promise<Response> {
     const terminalStatus = body.status === 'completed' || body.status === 'failed';
 
@@ -127,6 +134,39 @@ export class TenantOrchestrator {
 
     if ((result.meta.changes ?? 0) === 0) {
       return json({ ok: false, error: 'Run not found' }, 404);
+    }
+
+    if (body.status === 'completed') {
+      await this.env.DB.prepare(
+        `INSERT INTO agent_run_results (
+           tenant_id, run_id, output_text, output_json, model,
+           usage_input_tokens, usage_output_tokens, usage_cached_input_tokens,
+           runtime_ms, completed_at, updated_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?10)
+         ON CONFLICT(tenant_id, run_id) DO UPDATE SET
+           output_text = excluded.output_text,
+           output_json = excluded.output_json,
+           model = excluded.model,
+           usage_input_tokens = excluded.usage_input_tokens,
+           usage_output_tokens = excluded.usage_output_tokens,
+           usage_cached_input_tokens = excluded.usage_cached_input_tokens,
+           runtime_ms = excluded.runtime_ms,
+           completed_at = excluded.completed_at,
+           updated_at = excluded.updated_at`,
+      )
+        .bind(
+          body.tenantId,
+          body.runId,
+          body.outputText ?? null,
+          body.output === undefined ? null : JSON.stringify(body.output),
+          body.model ?? null,
+          body.usageInputTokens ?? null,
+          body.usageOutputTokens ?? null,
+          body.usageCachedInputTokens ?? null,
+          body.runtimeMs ?? null,
+          body.processedAt,
+        )
+        .run();
     }
 
     return json({

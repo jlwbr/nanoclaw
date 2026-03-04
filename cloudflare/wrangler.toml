@@ -8,6 +8,9 @@ compatibility_flags = ["nodejs_compat"]
 
 [vars]
 APP_ENV = "dev"
+AGENT_RUNTIME_MODE = "stub"
+# AGENT_RUNTIME_HTTP_URL = "https://runtime.example.com/execute"
+AGENT_QUEUE_MAX_ATTEMPTS = "5"
 
 [[d1_databases]]
 binding = "DB"

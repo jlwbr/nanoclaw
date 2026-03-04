@@ -1,5 +1,9 @@
 import { Hono } from 'hono';
 
+import {
+  RuntimeExecutionFailure,
+  executeRunJob,
+} from './runtime/executor';
 import { TenantOrchestrator } from './durable-objects/tenant-orchestrator';
 import {
   AgentRunJobMessage,
@@ -143,7 +147,10 @@ async function updateRunStatus(
   env: Env,
   job: AgentRunJobMessage,
   status: 'processing' | 'awaiting_runtime' | 'completed' | 'failed',
-  detail?: string,
+  updates: Omit<
+    Extract<TenantOrchestratorRequest, { type: 'run_status_update' }>,
+    'type' | 'runId' | 'tenantId' | 'status' | 'processedAt'
+  > = {},
 ): Promise<void> {
   const id = env.TENANT_ORCHESTRATOR.idFromName(job.tenantId);
   const stub = env.TENANT_ORCHESTRATOR.get(id);
@@ -153,8 +160,8 @@ async function updateRunStatus(
     runId: job.runId,
     tenantId: job.tenantId,
     status,
-    detail,
     processedAt: new Date().toISOString(),
+    ...updates,
   };
 
   await stub.fetch('https://tenant-orchestrator/events', {
@@ -164,17 +171,45 @@ async function updateRunStatus(
   });
 }
 
-async function processRunJob(env: Env, job: AgentRunJobMessage): Promise<void> {
+function parseMaxAttempts(env: Env): number {
+  const raw = env.AGENT_QUEUE_MAX_ATTEMPTS;
+  const parsed = Number.parseInt(raw ?? '', 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) return 5;
+  return parsed;
+}
+
+function retryDelaySeconds(attempts: number): number {
+  return Math.min(60, Math.max(2, 2 ** attempts));
+}
+
+async function processRunJob(
+  env: Env,
+  job: AgentRunJobMessage,
+): Promise<{ ok: true } | RuntimeExecutionFailure> {
+  const startedAt = Date.now();
   await updateRunStatus(env, job, 'processing');
 
-  // Runtime invocation is implemented in a later phase.
-  // For now, mark the run as accepted by the queue pipeline.
-  await updateRunStatus(
-    env,
-    job,
-    'awaiting_runtime',
-    'Queue dispatch succeeded; runtime integration pending',
-  );
+  const result = await executeRunJob(env, job);
+  if (!result.ok) {
+    await updateRunStatus(env, job, 'failed', {
+      detail: result.error,
+      runtimeMs: Date.now() - startedAt,
+    });
+    return result;
+  }
+
+  await updateRunStatus(env, job, 'completed', {
+    detail: result.detail,
+    outputText: result.outputText,
+    output: result.output,
+    model: result.model,
+    usageInputTokens: result.usageInputTokens,
+    usageOutputTokens: result.usageOutputTokens,
+    usageCachedInputTokens: result.usageCachedInputTokens,
+    runtimeMs: result.runtimeMs ?? Date.now() - startedAt,
+  });
+
+  return { ok: true };
 }
 
 const app = new Hono<{ Bindings: Env }>();
@@ -237,6 +272,7 @@ app.onError((err, c) => {
 export default {
   fetch: app.fetch,
   async queue(batch: MessageBatch<unknown>, env: Env): Promise<void> {
+    const maxAttempts = parseMaxAttempts(env);
     for (const message of batch.messages) {
       const parsed = parseRunJob(message.body);
       if (!parsed) {
@@ -246,16 +282,43 @@ export default {
       }
 
       try {
-        await processRunJob(env, parsed);
-        message.ack();
+        const result = await processRunJob(env, parsed);
+        if (result.ok) {
+          message.ack();
+          continue;
+        }
+
+        const shouldRetry =
+          result.retryable && message.attempts < maxAttempts;
+        if (shouldRetry) {
+          message.retry({
+            delaySeconds: retryDelaySeconds(message.attempts),
+          });
+        } else {
+          message.ack();
+        }
       } catch (err) {
         const runId = parsed.runId;
         console.error('queue process failed', {
           runId,
           tenantId: parsed.tenantId,
           err,
+          attempts: message.attempts,
         });
-        message.retry();
+
+        const detail =
+          err instanceof Error
+            ? err.message
+            : 'Unhandled queue processing error';
+        await updateRunStatus(env, parsed, 'failed', { detail });
+
+        if (message.attempts < maxAttempts) {
+          message.retry({
+            delaySeconds: retryDelaySeconds(message.attempts),
+          });
+        } else {
+          message.ack();
+        }
       }
     }
   },
