@@ -1,0 +1,60 @@
+name = "nanoclaw-hosted"
+main = "src/index.ts"
+compatibility_date = "2025-11-01"
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "web/dist"
+binding = "ASSETS"
+
+[vars]
+AGENT_RUNTIME_MODE = "service"
+APP_VERSION = "0.1.0"
+RUNTIME_MIN_VERSION = "0.1.0"
+AUTUMN_BASE_URL = "https://api.useautumn.com/v1"
+AUTUMN_PRODUCT_ID = "nanoclaw-hosted"
+OUTBOUND_MAX_ATTEMPTS = "5"
+CIRCUIT_BREAKER_WINDOW_SIZE = "20"
+CIRCUIT_BREAKER_ERROR_THRESHOLD = "0.5"
+
+[[durable_objects.bindings]]
+name = "TENANT_ORCHESTRATOR"
+class_name = "TenantOrchestrator"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["TenantOrchestrator"]
+
+[[queues.producers]]
+queue = "agent_run"
+binding = "AGENT_RUN_QUEUE"
+
+[[queues.producers]]
+queue = "outbound_delivery"
+binding = "OUTBOUND_DELIVERY_QUEUE"
+
+[[queues.consumers]]
+queue = "agent_run"
+max_batch_size = 10
+max_batch_timeout = 30
+max_retries = 5
+
+[[queues.consumers]]
+queue = "outbound_delivery"
+max_batch_size = 20
+max_batch_timeout = 30
+max_retries = 5
+
+[[r2_buckets]]
+binding = "ARTIFACTS"
+bucket_name = "nanoclaw-artifacts"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "nanoclaw-hosted"
+database_id = "replace-in-deploy"
+migrations_dir = "migrations"
+
+[[services]]
+binding = "AGENT_RUNTIME"
+service = "nanoclaw-agent-runtime"
